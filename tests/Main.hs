@@ -13,27 +13,27 @@ import Control.Monad
 import Control.Monad.IO.Class
 import Data.Bits
 import Data.ByteString (ByteString)
-import Data.ByteString qualified as B
-import Data.ByteString.Builder qualified as LB
-import Data.ByteString.Lazy qualified as LB
-import Data.Conduit qualified as C
-import Data.Conduit.List qualified as CL
-import Data.DList qualified as DList
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Builder as LB
+import qualified Data.ByteString.Lazy as LB
+import qualified Data.Conduit as C
+import qualified Data.Conduit.List as CL
+import qualified Data.DList as DList
 import Data.List (intercalate)
 import Data.Map (Map, (!))
-import Data.Map.Strict qualified as M
+import qualified Data.Map.Strict as M
 import Data.Maybe (fromJust)
-import Data.Set qualified as E
+import qualified Data.Set as E
 import Data.Text (Text)
-import Data.Text qualified as T
-import Data.Text.Encoding qualified as T
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 import Data.Time
 import Data.Version
 import Data.Word
 import Numeric.Natural
 import System.Directory
 import System.FilePath ((</>))
-import System.FilePath qualified as FP
+import qualified System.FilePath as FP
 import System.IO
 import System.IO.Error (isDoesNotExistError)
 import System.IO.Temp

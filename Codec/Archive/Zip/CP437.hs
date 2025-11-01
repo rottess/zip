@@ -15,10 +15,10 @@ where
 
 import Control.Arrow (first)
 import Data.ByteString (ByteString)
-import Data.ByteString qualified as B
+import qualified Data.ByteString as B
 import Data.Char
 import Data.Text (Text)
-import Data.Text qualified as T
+import qualified Data.Text as T
 import Data.Word (Word8)
 
 -- | Decode a 'ByteString' containing CP 437 encoded text.
