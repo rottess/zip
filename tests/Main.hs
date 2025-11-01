@@ -13,31 +13,40 @@ import Control.Monad
 import Control.Monad.IO.Class
 import Data.Bits
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as B
-import qualified Data.ByteString.Builder as LB
-import qualified Data.ByteString.Lazy as LB
-import qualified Data.Conduit as C
-import qualified Data.Conduit.List as CL
-import qualified Data.DList as DList
+import Data.ByteString qualified as B
+import Data.ByteString.Builder qualified as LB
+import Data.ByteString.Lazy qualified as LB
+import Data.Conduit qualified as C
+import Data.Conduit.List qualified as CL
+import Data.DList qualified as DList
 import Data.List (intercalate)
 import Data.Map (Map, (!))
-import qualified Data.Map.Strict as M
+import Data.Map.Strict qualified as M
 import Data.Maybe (fromJust)
-import qualified Data.Set as E
+import Data.Set qualified as E
 import Data.Text (Text)
-import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
+import Data.Text qualified as T
+import Data.Text.Encoding qualified as T
 import Data.Time
 import Data.Version
 import Data.Word
+import Numeric.Natural
 import System.Directory
 import System.FilePath ((</>))
-import qualified System.FilePath as FP
+import System.FilePath qualified as FP
 import System.IO
 import System.IO.Error (isDoesNotExistError)
 import System.IO.Temp
 import Test.Hspec
 import Test.QuickCheck hiding ((.&.))
+
+ffffffff :: Natural
+
+#ifdef HASKELL_ZIP_DEV_MODE
+ffffffff = 250
+#else
+ffffffff = 0xffffffff
+#endif
 
 -- | Zip tests. Please note that the Zip64 feature is not currently tested
 -- automatically because we'd need > 4GB of data. Handling such quantities
@@ -82,7 +91,7 @@ instance Arbitrary Text where
   arbitrary = T.pack <$> listOf1 arbitrary
 
 instance Arbitrary ByteString where
-  arbitrary = B.pack <$> listOf arbitrary
+  arbitrary = B.pack <$> scale (* 10) (listOf arbitrary)
 
 {- ORMOLU_DISABLE -}
 
@@ -194,22 +203,6 @@ binASCII = LB.toStrict . LB.toLazyByteString <$> go
         [ (10, (<>) <$> (LB.word8 <$> choose (0, 127)) <*> go),
           (1, return mempty)
         ]
-
-instance Show EntryDescription where
-  show ed =
-    "{ edCompression = "
-      ++ show (edCompression ed)
-      ++ "\n, edModTime = "
-      ++ show (edModTime ed)
-      ++ "\n, edUncompressedSize = "
-      ++ show (edUncompressedSize ed)
-      ++ "\n, edComment = "
-      ++ show (edComment ed)
-      ++ "\n, edExtraField = "
-      ++ show (edExtraField ed)
-      ++ "\n, edExtFileAttr = "
-      ++ show (edExternalFileAttrs ed)
-      ++ " }"
 
 instance Show (ZipArchive a) where
   show = const "<zip archive>"
@@ -385,25 +378,37 @@ versionNeededSpec =
     -- it should be mentioned that the version also depends on Zip64 feature
     property $ \(EM s desc z) -> do
       desc' <- fromJust <$> createArchive path (z >> commit >> getEntryDesc s)
-      edVersionNeeded desc'
-        `shouldBe` makeVersion
-          ( case edCompression desc of
-              Store -> [2, 0]
-              Deflate -> [2, 0]
-              BZip2 -> [4, 6]
-              Zstd -> [6, 3]
-          )
+      let minVersionZip64 =
+            makeVersion $
+              if edUncompressedSize desc' >= ffffffff
+                || edCompressedSize desc' >= ffffffff
+                then [4, 5]
+                else [2, 0]
+          minVersionCompression = makeVersion $ case edCompression desc of
+            Store -> [2, 0]
+            Deflate -> [2, 0]
+            BZip2 -> [4, 6]
+            Zstd -> [6, 3]
+          versionNeeded = max minVersionZip64 minVersionCompression
+      edVersionNeeded desc' `shouldBe` versionNeeded
 
 addEntrySpec :: SpecWith FilePath
 addEntrySpec =
-  context "when an entry is added" $
+  context "when an entry is added" $ do
     it "is there" $ \path ->
       property $ \m b s -> do
         info <- createArchive path $ do
           addEntry m b s
           commit
+          checkEntry' s
           (,) <$> getEntry s <*> (edCompression . (! s) <$> getEntries)
         info `shouldBe` (b, m)
+    it "does not add unnecessary zip64 extra fields" $ \path -> do
+      property $ \b s ->
+        fromIntegral (B.length b) < ffffffff ==> do
+          createArchive path (addEntry Store b s)
+          bytes <- B.drop (30 + rawSelectorLength s) <$> B.readFile path
+          bytes `shouldSatisfy` B.isPrefixOf b
 
 sinkEntrySpec :: SpecWith FilePath
 sinkEntrySpec =
@@ -413,6 +418,7 @@ sinkEntrySpec =
         info <- createArchive path $ do
           sinkEntry m (C.yield b) s
           commit
+          checkEntry' s
           (,)
             <$> sourceEntry s (CL.foldMap id)
             <*> (edCompression . (! s) <$> getEntries)
@@ -429,6 +435,7 @@ loadEntrySpec =
         createArchive path $ do
           loadEntry m s vpath
           commit
+          checkEntry' s
           liftIO (removeFile vpath)
           saveEntry s vpath
         B.readFile vpath `shouldReturn` b
@@ -437,7 +444,7 @@ loadEntrySpec =
 
 copyEntrySpec :: SpecWith FilePath
 copyEntrySpec =
-  context "when entry is copied form another archive" $
+  context "when entry is copied from another archive" $ do
     it "is there" $ \path ->
       property $ \m b s -> do
         let vpath = deriveVacant path
@@ -445,37 +452,76 @@ copyEntrySpec =
         info <- createArchive path $ do
           copyEntry vpath s s
           commit
+          checkEntry' s
           (,) <$> getEntry s <*> (edCompression . (! s) <$> getEntries)
         info `shouldBe` (b, m)
+    it "does not add unnecessary zip64 extra fields" $ \path -> do
+      property $ \b s ->
+        fromIntegral (B.length b) < ffffffff ==> do
+          let vpath = deriveVacant path
+          createArchive vpath $ addEntry Store b s
+          createArchive path $ copyEntry vpath s s
+          bytes <- B.drop (30 + rawSelectorLength s) <$> B.readFile path
+          bytes `shouldSatisfy` B.isPrefixOf b
 
 checkEntrySpec :: SpecWith FilePath
 checkEntrySpec = do
-  context "when entry is intact" $
-    it "passes the check" $ \path ->
-      property $ \m b s -> do
-        check <- createArchive path $ do
-          addEntry m b s
-          commit
-          checkEntry s
-        check `shouldBe` True
-  context "when entry is corrupted" $
-    it "does not pass the check" $ \path ->
-      property $ \b s ->
-        not (B.null b) ==> do
-          let headerLength = 30 + (B.length . T.encodeUtf8 . getEntryName $ s)
-          localFileHeaderOffset <- createArchive path $ do
-            addEntry Store b s
+  context "for entries added via addEntry" $ do
+    context "when entry is intact" $
+      it "passes the check" $ \path ->
+        property $ \m b s ->
+          asIO . createArchive path $ do
+            addEntry m b s
             commit
-            fromIntegral . edOffset . (! s) <$> getEntries
-          withFile path ReadWriteMode $ \h -> do
-            hSeek
-              h
-              AbsoluteSeek
-              (localFileHeaderOffset + fromIntegral headerLength)
-            byte <- B.map complement <$> B.hGet h 1
-            hSeek h RelativeSeek (-1)
-            B.hPut h byte
-          withArchive path (checkEntry s) `shouldReturn` False
+            checkEntry' s
+    context "when entry is corrupted" $
+      it "does not pass the check" $ \path ->
+        property $ \b s ->
+          not (B.null b) ==> do
+            let zip64Length =
+                  if fromIntegral (B.length b) >= ffffffff
+                    then 20
+                    else 0
+                headerLength = 30 + rawSelectorLength s + zip64Length
+            localFileHeaderOffset <- createArchive path $ do
+              addEntry Store b s
+              commit
+              fromIntegral . edOffset . (! s) <$> getEntries
+            withFile path ReadWriteMode $ \h -> do
+              hSeek
+                h
+                AbsoluteSeek
+                (localFileHeaderOffset + fromIntegral headerLength)
+              byte <- B.map complement <$> B.hGet h 1
+              hSeek h RelativeSeek (-1)
+              B.hPut h byte
+            withArchive path (checkEntry s) `shouldReturn` False
+  context "for entries added via sinkEntry" $ do
+    context "when entry is intact" $
+      it "passes the check" $ \path ->
+        property $ \m b s ->
+          asIO . createArchive path $ do
+            sinkEntry m (C.yield b) s
+            commit
+            checkEntry' s
+    context "when entry is corrupted" $
+      it "does not pass the check" $ \path ->
+        property $ \b s ->
+          not (B.null b) ==> do
+            let headerLength = 50 + rawSelectorLength s
+            localFileHeaderOffset <- createArchive path $ do
+              sinkEntry Store (C.yield b) s
+              commit
+              fromIntegral . edOffset . (! s) <$> getEntries
+            withFile path ReadWriteMode $ \h -> do
+              hSeek
+                h
+                AbsoluteSeek
+                (localFileHeaderOffset + fromIntegral headerLength)
+              byte <- B.map complement <$> B.hGet h 1
+              hSeek h RelativeSeek (-1)
+              B.hPut h byte
+            withArchive path (checkEntry s) `shouldReturn` False
 
 recompressSpec :: SpecWith FilePath
 recompressSpec =
@@ -485,8 +531,10 @@ recompressSpec =
         info <- createArchive path $ do
           addEntry m b s
           commit
+          checkEntry' s
           recompress m' s
           commit
+          checkEntry' s
           (,) <$> getEntry s <*> (edCompression . (! s) <$> getEntries)
         info `shouldBe` (b, m')
 
@@ -796,6 +844,12 @@ withSandbox :: ActionWith FilePath -> IO ()
 withSandbox action = withSystemTempDirectory "zip-sandbox" $ \dir ->
   action (dir </> "foo.zip")
 
+-- | Like 'checkEntry' but automatically aborts the test if the check fails.
+checkEntry' :: EntrySelector -> ZipArchive ()
+checkEntry' s = do
+  r <- checkEntry s
+  liftIO (if r then return () else fail "Entry integrity check failed!")
+
 -- | Given a primary name (name of archive), generate a name that does not
 -- collide with it.
 deriveVacant :: FilePath -> FilePath
@@ -875,3 +929,11 @@ listDirRecur path = DList.toList <$> go ""
               if isDir
                 then go adir'
                 else return mempty
+
+-- | Constrain the type of the argument monad to 'IO'.
+asIO :: IO a -> IO a
+asIO = id
+
+-- | Get the length in bytes of an encoded 'EntrySelector'.
+rawSelectorLength :: EntrySelector -> Int
+rawSelectorLength = B.length . T.encodeUtf8 . getEntryName

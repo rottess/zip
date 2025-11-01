@@ -13,18 +13,10 @@
 -- Portability :  portable
 --
 -- Low-level, non-public types and operations.
-module Codec.Archive.Zip.Internal
-  ( PendingAction (..),
-    targetEntry,
-    scanArchive,
-    sourceEntry,
-    crc32Sink,
-    commit,
-  )
-where
+module Codec.Archive.Zip.Internal where
 
 import Codec.Archive.Zip.CP437 (decodeCP437)
-import Codec.Archive.Zip.Type
+import Codec.Archive.Zip.Internal.Type
 import Conduit (PrimMonad)
 import Control.Applicative (many, (<|>))
 import Control.Exception (bracketOnError, catchJust)
@@ -35,26 +27,25 @@ import Control.Monad.Trans.Resource (MonadResource, ResourceT)
 import Data.Bits
 import Data.Bool (bool)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as B
+import Data.ByteString qualified as B
 import Data.Char (ord)
 import Data.Conduit (ConduitT, ZipSink (..), (.|))
-import qualified Data.Conduit as C
-import qualified Data.Conduit.Binary as CB
-import qualified Data.Conduit.List as CL
-import qualified Data.Conduit.Zlib as Z
+import Data.Conduit qualified as C
+import Data.Conduit.Binary qualified as CB
+import Data.Conduit.List qualified as CL
+import Data.Conduit.Zlib qualified as Z
 import Data.Digest.CRC32 (crc32Update)
 import Data.Fixed (Fixed (..))
-import Data.Foldable (foldl')
-import Data.Map.Strict (Map, (!))
-import qualified Data.Map.Strict as M
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as M
 import Data.Maybe (catMaybes, fromJust, isNothing)
 import Data.Sequence (Seq, (><), (|>))
-import qualified Data.Sequence as S
+import Data.Sequence qualified as S
 import Data.Serialize
-import qualified Data.Set as E
+import Data.Set qualified as E
 import Data.Text (Text)
-import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
+import Data.Text qualified as T
+import Data.Text.Encoding qualified as T
 import Data.Time
 import Data.Version
 import Data.Void
@@ -77,6 +68,10 @@ import qualified Data.Conduit.BZlib as BZ
 import qualified Data.Conduit.Zstd as Zstandard
 #endif
 
+#if !MIN_VERSION_base(4,20,0)
+import Data.Foldable (foldl')
+#endif
+
 ----------------------------------------------------------------------------
 -- Data types
 
@@ -88,7 +83,9 @@ data PendingAction
       CompressionMethod
       (ConduitT () ByteString (ResourceT IO) ())
       EntrySelector
-  | -- | Copy an entry form another archive without re-compression
+  | -- | Add an entry given its content as a string ByteString.
+    StrictEntry CompressionMethod ByteString EntrySelector
+  | -- | Copy an entry from another archive without re-compression
     CopyEntry FilePath EntrySelector EntrySelector
   | -- | Change the name of the entry inside archive
     RenameEntry EntrySelector EntrySelector
@@ -117,7 +114,7 @@ data PendingAction
 -- archive.
 data ProducingActions = ProducingActions
   { paCopyEntry :: Map FilePath (Map EntrySelector EntrySelector),
-    paSinkEntry :: Map EntrySelector (ConduitT () ByteString (ResourceT IO) ())
+    paSinkEntry :: Map EntrySelector (EntryOrigin, ConduitT () ByteString (ResourceT IO) ())
   }
 
 -- | A collection of editing actions, that is, actions that modify already
@@ -135,11 +132,13 @@ data EditingActions = EditingActions
 -- | The origin of entries that can be streamed into archive.
 data EntryOrigin
   = GenericOrigin
+  | StrictOrigin Natural -- uncompressed length
   | Borrowed EntryDescription
+  deriving (Eq)
 
 -- | The type of the file header: local or central directory.
 data HeaderType
-  = LocalHeader
+  = LocalHeader EntryOrigin
   | CentralDirHeader
   deriving (Eq)
 
@@ -265,31 +264,29 @@ commit ::
   FilePath ->
   -- | Archive description
   ArchiveDescription ->
-  -- | Current list of entires
+  -- | Current list of entries
   Map EntrySelector EntryDescription ->
   -- | Collection of pending actions
   Seq PendingAction ->
   IO ()
 commit path ArchiveDescription {..} entries xs =
   withNewFile path $ \h -> do
-    let (ProducingActions coping sinking, editing) =
+    let (ProducingActions copying sinking, editing) =
           optimize (toRecreatingActions path entries >< xs)
         comment = predictComment adComment xs
     copiedCD <-
       M.unions
-        <$> forM
-          (M.keys coping)
-          ( \srcPath ->
-              copyEntries h srcPath (coping ! srcPath) editing
+        <$> M.traverseWithKey
+          ( \srcPath m ->
+              copyEntries h srcPath m editing
           )
-    let sinkingKeys = M.keys $ sinking `M.difference` copiedCD
+          copying
     sunkCD <-
-      M.fromList
-        <$> forM
-          sinkingKeys
-          ( \selector ->
-              sinkEntry h selector GenericOrigin (sinking ! selector) editing
-          )
+      M.traverseWithKey
+        ( \selector (origin, source) ->
+            sinkEntry h selector origin source editing
+        )
+        (sinking `M.difference` copiedCD)
     writeCD h comment (copiedCD `M.union` sunkCD)
 
 -- | Create a new file with the guarantee that in the case of an exception
@@ -356,13 +353,24 @@ optimize =
     f (pa, ea) a = case a of
       SinkEntry m src s ->
         ( pa
-            { paSinkEntry = M.insert s src (paSinkEntry pa),
+            { paSinkEntry = M.insert s (GenericOrigin, src) (paSinkEntry pa),
               paCopyEntry = M.map (M.filter (/= s)) (paCopyEntry pa)
             },
           (clearEditingFor s ea)
             { eaCompression = M.insert s m (eaCompression ea)
             }
         )
+      StrictEntry m bs s ->
+        ( pa
+            { paSinkEntry = M.insert s (origin, C.yield bs) (paSinkEntry pa),
+              paCopyEntry = M.map (M.filter (/= s)) (paCopyEntry pa)
+            },
+          (clearEditingFor s ea)
+            { eaCompression = M.insert s m (eaCompression ea)
+            }
+        )
+        where
+          origin = StrictOrigin (fromIntegral $ B.length bs)
       CopyEntry path os ns ->
         ( pa
             { paSinkEntry = M.delete ns (paSinkEntry pa),
@@ -460,19 +468,21 @@ copyEntries ::
   EditingActions ->
   -- | Info to generate central directory file headers later
   IO (Map EntrySelector EntryDescription)
-copyEntries h path m e = do
+copyEntries h path names editing = do
   entries <- snd <$> scanArchive path
-  done <- forM (M.keys m) $ \s ->
-    case s `M.lookup` entries of
-      Nothing -> throwM (EntryDoesNotExist path s)
-      Just desc ->
-        sinkEntry
-          h
-          (m ! s)
-          (Borrowed desc)
-          (sourceEntry path desc False)
-          e
-  return (M.fromList done)
+  M.foldlWithKey
+    ( \acc oldName newName ->
+        case M.lookup oldName entries of
+          Nothing -> throwM (EntryDoesNotExist path oldName)
+          Just oldDesc ->
+            M.insert newName
+              <$> sinkEntry h newName (Borrowed oldDesc) src editing
+              <*> acc
+            where
+              src = sourceEntry path oldDesc False
+    )
+    mempty
+    names
 
 -- | Sink an entry from the given stream into the file associated with the
 -- given 'Handle'.
@@ -488,31 +498,28 @@ sinkEntry ::
   -- | Additional info that can influence result
   EditingActions ->
   -- | Info to generate the central directory file headers later
-  IO (EntrySelector, EntryDescription)
+  IO EntryDescription
 sinkEntry h s o src EditingActions {..} = do
   currentTime <- getCurrentTime
   offset <- hTell h
   let compressed = case o of
-        GenericOrigin -> Store
         Borrowed ed -> edCompression ed
+        _ -> Store
       compression = M.findWithDefault compressed s eaCompression
       recompression = compression /= compressed
       modTime = case o of
-        GenericOrigin -> currentTime
         Borrowed ed -> edModTime ed
-      extFileAttr = case o of
-        GenericOrigin -> M.findWithDefault defaultFileMode s eaExtFileAttr
-        Borrowed _ -> M.findWithDefault defaultFileMode s eaExtFileAttr
+        _ -> currentTime
+      extFileAttr = M.findWithDefault defaultFileMode s eaExtFileAttr
       oldExtraFields = case o of
-        GenericOrigin -> M.empty
         Borrowed ed -> edExtraField ed
+        _ -> M.empty
       extraField =
         (M.findWithDefault M.empty s eaExtraField `M.union` oldExtraFields)
           `M.difference` M.findWithDefault M.empty s eaDeleteField
       oldComment = case (o, M.lookup s eaDeleteComment) of
-        (GenericOrigin, _) -> Nothing
         (Borrowed ed, Nothing) -> edComment ed
-        (Borrowed _, Just ()) -> Nothing
+        _ -> Nothing
       desc0 =
         EntryDescription -- to write in local header
           { edVersionMadeBy = zipVersion,
@@ -527,7 +534,7 @@ sinkEntry h s o src EditingActions {..} = do
             edExtraField = extraField,
             edExternalFileAttrs = extFileAttr
           }
-  B.hPut h (runPut (putHeader LocalHeader s desc0))
+  B.hPut h (runPut (putHeader (LocalHeader o) s desc0))
   DataDescriptor {..} <-
     C.runConduitRes $
       if recompression
@@ -538,12 +545,6 @@ sinkEntry h s o src EditingActions {..} = do
         else src .| sinkData h Store
   afterStreaming <- hTell h
   let desc1 = case o of
-        GenericOrigin ->
-          desc0
-            { edCRC32 = ddCRC32,
-              edCompressedSize = ddCompressedSize,
-              edUncompressedSize = ddUncompressedSize
-            }
         Borrowed ed ->
           desc0
             { edCRC32 =
@@ -553,15 +554,21 @@ sinkEntry h s o src EditingActions {..} = do
               edUncompressedSize =
                 bool (edUncompressedSize ed) ddUncompressedSize recompression
             }
+        _ ->
+          desc0
+            { edCRC32 = ddCRC32,
+              edCompressedSize = ddCompressedSize,
+              edUncompressedSize = ddUncompressedSize
+            }
       desc2 =
         desc1
           { edVersionNeeded =
               getZipVersion (needsZip64 desc1) (Just compression)
           }
   hSeek h AbsoluteSeek offset
-  B.hPut h (runPut (putHeader LocalHeader s desc2))
+  B.hPut h (runPut (putHeader (LocalHeader o) s desc2))
   hSeek h AbsoluteSeek afterStreaming
-  return (s, desc2)
+  return desc2
 
 {- ORMOLU_DISABLE -}
 
@@ -779,25 +786,29 @@ makeZip64ExtraField ::
   -- | Resulting representation
   ByteString
 makeZip64ExtraField headerType Zip64ExtraField {..} = runPut $ do
-  when (headerType == LocalHeader || z64efUncompressedSize >= ffffffff) $
-    putWord64le (fromIntegral z64efUncompressedSize) -- uncompressed size
-  when (headerType == LocalHeader || z64efCompressedSize >= ffffffff) $
-    putWord64le (fromIntegral z64efCompressedSize) -- compressed size
-  when (headerType == CentralDirHeader && z64efOffset >= ffffffff) $
+  case headerType of
+    LocalHeader _ -> do
+      putWord64le (fromIntegral z64efUncompressedSize) -- uncompressed size
+      putWord64le (fromIntegral z64efCompressedSize) -- compressed size
+    CentralDirHeader -> do
+      when (z64efUncompressedSize >= ffffffff) $
+        putWord64le (fromIntegral z64efUncompressedSize) -- uncompressed size
+      when (z64efCompressedSize >= ffffffff) $
+        putWord64le (fromIntegral z64efCompressedSize) -- compressed size
+  when (z64efOffset >= ffffffff) $
     putWord64le (fromIntegral z64efOffset) -- offset of local file header
 
 -- | Create 'ByteString' representing an extra field.
 putExtraField :: Map Word16 ByteString -> Put
-putExtraField m = forM_ (M.keys m) $ \headerId -> do
-  let b = B.take 0xffff (m ! headerId)
+putExtraField = M.foldMapWithKey $ \headerId bs -> do
+  let b = B.take 0xffff bs
   putWord16le headerId
   putWord16le (fromIntegral $ B.length b)
   putByteString b
 
 -- | Create 'ByteString' representing the entire central directory.
 putCD :: Map EntrySelector EntryDescription -> Put
-putCD m = forM_ (M.keys m) $ \s ->
-  putHeader CentralDirHeader s (m ! s)
+putCD = M.foldMapWithKey (putHeader CentralDirHeader)
 
 -- | Create 'ByteString' representing either a local file header or a
 -- central directory file header.
@@ -840,9 +851,15 @@ putHeader headerType s entry@EntryDescription {..} = do
               z64efCompressedSize = edCompressedSize,
               z64efOffset = edOffset
             }
+      appendZip64 =
+        case headerType of
+          LocalHeader (StrictOrigin size) -> size >= ffffffff
+          LocalHeader (Borrowed ed) -> entryUsesZip64 ed
+          LocalHeader GenericOrigin -> True
+          CentralDirHeader -> needsZip64 entry
       extraField =
         B.take 0xffff . runPut . putExtraField $
-          if needsZip64 entry
+          if appendZip64
             then M.insert 1 zip64ef edExtraField
             else edExtraField
   putWord16le (fromIntegral $ B.length extraField) -- extra field length
@@ -1051,6 +1068,7 @@ withSaturation x =
 -- | Determine the target entry of an action.
 targetEntry :: PendingAction -> Maybe EntrySelector
 targetEntry (SinkEntry _ _ s) = Just s
+targetEntry (StrictEntry _ _ s) = Just s
 targetEntry (CopyEntry _ _ s) = Just s
 targetEntry (RenameEntry s _) = Just s
 targetEntry (DeleteEntry s) = Just s
@@ -1126,6 +1144,10 @@ needsZip64 EntryDescription {..} =
   any
     (>= ffffffff)
     [edOffset, edCompressedSize, edUncompressedSize]
+
+-- | Check if an entry has Zip64 extra fields.
+entryUsesZip64 :: EntryDescription -> Bool
+entryUsesZip64 EntryDescription {..} = M.member 1 edExtraField
 
 -- | Determine “version needed to extract” that should be written to the
 -- headers given the need of the Zip64 feature and the compression method.
@@ -1204,8 +1226,8 @@ fromMsDosTime MsDosTime {..} =
 ffff, ffffffff :: Natural
 
 #ifdef HASKELL_ZIP_DEV_MODE
-ffff     = 200
-ffffffff = 5000
+ffff     = 25
+ffffffff = 250
 #else
 ffff     = 0xffff
 ffffffff = 0xffffffff

@@ -2,7 +2,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 
 -- |
--- Module      :  Codec.Archive.Zip.Type
+-- Module      :  Codec.Archive.Zip.Internal.Type
 -- Copyright   :  © 2016–present Mark Karpov
 -- License     :  BSD 3 clause
 --
@@ -11,7 +11,7 @@
 -- Portability :  portable
 --
 -- Types used by the package.
-module Codec.Archive.Zip.Type
+module Codec.Archive.Zip.Internal.Type
   ( -- * Entry selector
     EntrySelector,
     mkEntrySelector,
@@ -34,25 +34,24 @@ where
 import Control.Exception (Exception)
 import Control.Monad.Catch (MonadThrow (..))
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as B
+import Data.ByteString qualified as B
 import Data.CaseInsensitive (CI)
-import qualified Data.CaseInsensitive as CI
+import Data.CaseInsensitive qualified as CI
 import Data.Data (Data)
 import Data.List.NonEmpty (NonEmpty)
-import qualified Data.List.NonEmpty as NE
+import Data.List.NonEmpty qualified as NE
 import Data.Map (Map)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
-import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
+import Data.Text qualified as T
+import Data.Text.Encoding qualified as T
 import Data.Time.Clock (UTCTime)
-import Data.Typeable (Typeable)
 import Data.Version (Version)
 import Data.Word (Word16, Word32)
 import Numeric.Natural
-import qualified System.FilePath as FP
-import qualified System.FilePath.Posix as Posix
-import qualified System.FilePath.Windows as Windows
+import System.FilePath qualified as FP
+import System.FilePath.Posix qualified as Posix
+import System.FilePath.Windows qualified as Windows
 
 ----------------------------------------------------------------------------
 -- Entry selector
@@ -75,7 +74,7 @@ newtype EntrySelector = EntrySelector
   { -- | Path pieces of relative path inside archive
     unES :: NonEmpty (CI String)
   }
-  deriving (Eq, Ord, Typeable)
+  deriving (Eq, Ord)
 
 instance Show EntrySelector where
   show = show . unEntrySelector
@@ -130,7 +129,7 @@ getEntryName =
 newtype EntrySelectorException
   = -- | 'EntrySelector' cannot be created from this path
     InvalidEntrySelector FilePath
-  deriving (Eq, Ord, Typeable)
+  deriving (Eq, Ord)
 
 instance Show EntrySelectorException where
   show (InvalidEntrySelector path) = "Cannot build selector from " ++ show path
@@ -170,7 +169,7 @@ data EntryDescription = EntryDescription
     -- @since 1.2.0
     edExternalFileAttrs :: Word32
   }
-  deriving (Eq, Typeable)
+  deriving (Eq, Show)
 
 -- | The supported compression methods.
 data CompressionMethod
@@ -184,7 +183,7 @@ data CompressionMethod
     --
     -- @since 1.6.0
     Zstd
-  deriving (Show, Read, Eq, Ord, Enum, Bounded, Data, Typeable)
+  deriving (Show, Read, Eq, Ord, Enum, Bounded, Data)
 
 ----------------------------------------------------------------------------
 -- Archive description
@@ -198,7 +197,7 @@ data ArchiveDescription = ArchiveDescription
     -- | The size of central directory record
     adCDSize :: Natural
   }
-  deriving (Show, Read, Eq, Ord, Typeable, Data)
+  deriving (Show, Read, Eq, Ord, Data)
 
 ----------------------------------------------------------------------------
 -- Exceptions
@@ -215,7 +214,7 @@ data ZipException
     UnsupportedCompressionMethod CompressionMethod
   | -- | Thrown when archive structure cannot be parsed.
     ParsingFailed FilePath String
-  deriving (Eq, Ord, Typeable)
+  deriving (Eq, Ord)
 
 instance Show ZipException where
   show (EntryDoesNotExist file s) =
